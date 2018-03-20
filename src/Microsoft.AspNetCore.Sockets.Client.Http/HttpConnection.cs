@@ -29,14 +29,17 @@ namespace Microsoft.AspNetCore.Sockets.Client
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger _logger;
 
-        private volatile ConnectionState _connectionState = ConnectionState.Disconnected;
-        private readonly object _stateChangeLock = new object();
+        private readonly SemaphoreSlim _stateLock = new SemaphoreSlim(1, 1);
+        private bool _disposed = false;
+        private bool _started = false;
 
-        private volatile IDuplexPipe _transportChannel;
+        private IDuplexPipe _transportPipe;
+        private IDuplexPipe _applicationPipe;
+
         private readonly HttpClient _httpClient;
         private readonly HttpOptions _httpOptions;
-        private volatile ITransport _transport;
-        private volatile Task _receiveLoopTask;
+        private ITransport _transport;
+        private Task _receiveLoopTask;
         private TaskCompletionSource<object> _startTcs;
         private TaskCompletionSource<object> _closeTcs;
         private TaskQueue _eventQueue;
@@ -44,8 +47,8 @@ namespace Microsoft.AspNetCore.Sockets.Client
         private string _connectionId;
         private Exception _abortException;
         private readonly TimeSpan _eventQueueDrainTimeout = TimeSpan.FromSeconds(5);
-        private PipeReader Input => _transportChannel.Input;
-        private PipeWriter Output => _transportChannel.Output;
+        private PipeReader Input => _transportPipe.Input;
+        private PipeWriter Output => _transportPipe.Output;
         private readonly List<ReceiveCallback> _callbacks = new List<ReceiveCallback>();
         private readonly TransportType _requestedTransportType = TransportType.All;
         private readonly ConnectionLogScope _logScope;
@@ -95,50 +98,6 @@ namespace Microsoft.AspNetCore.Sockets.Client
             _scopeDisposable = _logger.BeginScope(_logScope);
         }
 
-        private HttpClient CreateHttpClient()
-        {
-            HttpMessageHandler httpMessageHandler = null;
-            if (_httpOptions != null)
-            {
-                var httpClientHandler = new HttpClientHandler();
-                if (_httpOptions.Proxy != null)
-                {
-                    httpClientHandler.Proxy = _httpOptions.Proxy;
-                }
-                if (_httpOptions.Cookies != null)
-                {
-                    httpClientHandler.CookieContainer = _httpOptions.Cookies;
-                }
-                if (_httpOptions.ClientCertificates != null)
-                {
-                    httpClientHandler.ClientCertificates.AddRange(_httpOptions.ClientCertificates);
-                }
-                if (_httpOptions.UseDefaultCredentials != null)
-                {
-                    httpClientHandler.UseDefaultCredentials = _httpOptions.UseDefaultCredentials.Value;
-                }
-                if (_httpOptions.Credentials != null)
-                {
-                    httpClientHandler.Credentials = _httpOptions.Credentials;
-                }
-
-                httpMessageHandler = httpClientHandler;
-                if (_httpOptions.HttpMessageHandler != null)
-                {
-                    httpMessageHandler = _httpOptions.HttpMessageHandler(httpClientHandler);
-                    if (httpMessageHandler == null)
-                    {
-                        throw new InvalidOperationException("Configured HttpMessageHandler did not return a value.");
-                    }
-                }
-            }
-
-            var httpClient = httpMessageHandler == null ? new HttpClient() : new HttpClient(httpMessageHandler);
-            httpClient.Timeout = HttpClientTimeout;
-
-            return httpClient;
-        }
-
         public HttpConnection(Uri url, ITransportFactory transportFactory, ILoggerFactory loggerFactory, HttpOptions httpOptions)
         {
             Url = url ?? throw new ArgumentNullException(nameof(url));
@@ -152,39 +111,8 @@ namespace Microsoft.AspNetCore.Sockets.Client
         }
 
         public Task StartAsync() => StartAsync(TransferFormat.Binary);
+
         public async Task StartAsync(TransferFormat transferFormat) => await StartAsyncCore(transferFormat).ForceAsync();
-
-        private Task StartAsyncCore(TransferFormat transferFormat)
-        {
-            if (ChangeState(from: ConnectionState.Disconnected, to: ConnectionState.Connecting) != ConnectionState.Disconnected)
-            {
-                return Task.FromException(
-                    new InvalidOperationException($"Cannot start a connection that is not in the {nameof(ConnectionState.Disconnected)} state."));
-            }
-
-            _startTcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _eventQueue = new TaskQueue();
-
-            StartAsyncInternal(transferFormat)
-                .ContinueWith(t =>
-                {
-                    var abortException = _abortException;
-                    if (t.IsFaulted || abortException != null)
-                    {
-                        _startTcs.SetException(_abortException ?? t.Exception.InnerException);
-                    }
-                    else if (t.IsCanceled)
-                    {
-                        _startTcs.SetCanceled();
-                    }
-                    else
-                    {
-                        _startTcs.SetResult(null);
-                    }
-                });
-
-            return _startTcs.Task;
-        }
 
         private async Task<NegotiationResponse> GetNegotiationResponse()
         {
@@ -194,153 +122,136 @@ namespace Microsoft.AspNetCore.Sockets.Client
             return negotiationResponse;
         }
 
-        private async Task StartAsyncInternal(TransferFormat transferFormat)
+        private async Task StartAsyncCore(TransferFormat transferFormat)
         {
-            Log.HttpConnectionStarting(_logger);
+            CheckDisposed();
+
+            await _stateLock.WaitAsync();
 
             try
             {
-                var connectUrl = Url;
-                if (_requestedTransportType == TransportType.WebSockets)
+                CheckDisposed();
+                if (!_started)
                 {
-                    Log.StartingTransport(_logger, _requestedTransportType, connectUrl);
-                    await StartTransport(connectUrl, _requestedTransportType, transferFormat);
-                }
-                else
-                {
-                    var negotiationResponse = await GetNegotiationResponse();
-
-                    // Connection is being disposed while start was in progress
-                    if (_connectionState == ConnectionState.Disposed)
-                    {
-                        Log.HttpConnectionClosed(_logger);
-                        return;
-                    }
-
-                    // This should only need to happen once
-                    connectUrl = CreateConnectUrl(Url, negotiationResponse.ConnectionId);
-
-                    // We're going to search for the transfer format as a string because we don't want to parse
-                    // all the transfer formats in the negotiation response, and we want to allow transfer formats
-                    // we don't understand in the negotiate response.
-                    var transferFormatString = transferFormat.ToString();
-
-                    foreach (var transport in negotiationResponse.AvailableTransports)
-                    {
-                        if (!Enum.TryParse<TransportType>(transport.Transport, out var transportType))
-                        {
-                            Log.TransportNotSupported(_logger, transport.Transport);
-                            continue;
-                        }
-
-                        try
-                        {
-                            if ((transportType & _requestedTransportType) == 0)
-                            {
-                                Log.TransportDisabledByClient(_logger, transportType);
-                            }
-                            else if (!transport.TransferFormats.Contains(transferFormatString, StringComparer.Ordinal))
-                            {
-                                Log.TransportDoesNotSupportTransferFormat(_logger, transportType, transferFormat);
-                            }
-                            else
-                            {
-                                // The negotiation response gets cleared in the fallback scenario.
-                                if (negotiationResponse == null)
-                                {
-                                    negotiationResponse = await GetNegotiationResponse();
-                                    connectUrl = CreateConnectUrl(Url, negotiationResponse.ConnectionId);
-                                }
-
-                                Log.StartingTransport(_logger, transportType, connectUrl);
-                                await StartTransport(connectUrl, transportType, transferFormat);
-                                break;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.TransportFailed(_logger, transportType, ex);
-                            // Try the next transport
-                            // Clear the negotiation response so we know to re-negotiate.
-                            negotiationResponse = null;
-                        }
-                    }
+                    throw new InvalidOperationException($"The '{nameof(StartAsync)}' method cannot be called if the connection has already been started.");
                 }
 
-                if (_transport == null)
-                {
-                    throw new InvalidOperationException("Unable to connect to the server with any of the available transports.");
-                }
+                _startTcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _eventQueue = new TaskQueue();
+
+                Log.HttpConnectionStarting(_logger);
+
+                await SelectAndStartTransport(transferFormat);
+
+                // Start receiving
+                _receiveLoopTask = ReceiveAsync();
+
+                // Wire up to the Pipe's OnWriterCompleted, which indicates the transport completed (because the server closed).
+                // We dump the task from our OnWriterCompleted method because OnWriterCompleted is void-returning.
+                // Also, @pakrym says that if the pipe is already completed at the time we call this, the callback will still be run.
+                Input.OnWriterCompleted((exception, state) => _ = OnWriterCompleted(exception), null);
             }
-
-            catch
+            finally
             {
-                // The connection can now be either in the Connecting or Disposed state - only change the state to
-                // Disconnected if the connection was in the Connecting state to not resurrect a Disposed connection
-                ChangeState(from: ConnectionState.Connecting, to: ConnectionState.Disconnected);
-                throw;
+                _stateLock.Release();
             }
+        }
 
-            // if the connection is not in the Connecting state here it means the user called DisposeAsync while
-            // the connection was starting
-            if (ChangeState(from: ConnectionState.Connecting, to: ConnectionState.Connected) == ConnectionState.Connecting)
+        private async Task OnWriterCompleted(Exception exception)
+        {
+            // We're done, mark as disposed.
+            _disposed = true;
+
+            Log.ProcessRemainingMessages(_logger);
+            await _receiveLoopTask;
+
+            Log.DrainEvents(_logger);
+            await Task.WhenAny(_eventQueue.Drain().NoThrow(), Task.Delay(_eventQueueDrainTimeout));
+
+            Log.CompleteClosed(_logger);
+            _logScope.ConnectionId = null;
+
+            try
             {
-                _closeTcs = new TaskCompletionSource<object>();
+                Closed?.Invoke(this, exception);
+            }
+            catch (Exception ex)
+            {
+                // Suppress (but log) the exception, this is user code
+                Log.ErrorDuringClosedEvent(_logger, ex);
+            }
+        }
 
-                Input.OnWriterCompleted(async (exception, state) =>
+        private async Task SelectAndStartTransport(TransferFormat transferFormat)
+        {
+            if (_requestedTransportType == TransportType.WebSockets)
+            {
+                Log.StartingTransport(_logger, _requestedTransportType, connectUrl);
+                await StartTransport(Url, _requestedTransportType, transferFormat);
+            }
+            else
+            {
+                var negotiationResponse = await GetNegotiationResponse();
+
+                // Connection is being disposed while start was in progress
+                CheckDisposed();
+
+                // This should only need to happen once
+                var connectUrl = CreateConnectUrl(Url, negotiationResponse.ConnectionId);
+
+                // We're going to search for the transfer format as a string because we don't want to parse
+                // all the transfer formats in the negotiation response, and we want to allow transfer formats
+                // we don't understand in the negotiate response.
+                var transferFormatString = transferFormat.ToString();
+
+                foreach (var transport in negotiationResponse.AvailableTransports)
                 {
-                    // Grab the exception and then clear it.
-                    // See comment at AbortAsync for more discussion on the thread-safety
-                    // StartAsync can't be called until the ChangeState below, so we're OK.
-                    var abortException = _abortException;
-                    _abortException = null;
+                    // Don't keep falling back if we're disposed while trying to connect.
+                    CheckDisposed();
 
-                    // There is an inherent race between receive and close. Removing the last message from the channel
-                    // makes Input.Completion task completed and runs this continuation. We need to await _receiveLoopTask
-                    // to make sure that the message removed from the channel is processed before we drain the queue.
-                    // There is a short window between we start the channel and assign the _receiveLoopTask a value.
-                    // To make sure that _receiveLoopTask can be awaited (i.e. is not null) we need to await _startTask.
-                    Log.ProcessRemainingMessages(_logger);
-
-                    await _startTcs.Task;
-                    await _receiveLoopTask;
-
-                    Log.DrainEvents(_logger);
-
-                    await Task.WhenAny(_eventQueue.Drain().NoThrow(), Task.Delay(_eventQueueDrainTimeout));
-
-                    Log.CompleteClosed(_logger);
-                    _logScope.ConnectionId = null;
-
-                    // At this point the connection can be either in the Connected or Disposed state. The state should be changed
-                    // to the Disconnected state only if it was in the Connected state.
-                    // From this point on, StartAsync can be called at any time.
-                    ChangeState(from: ConnectionState.Connected, to: ConnectionState.Disconnected);
-
-                    _closeTcs.SetResult(null);
+                    if (!Enum.TryParse<TransportType>(transport.Transport, out var transportType))
+                    {
+                        Log.TransportNotSupported(_logger, transport.Transport);
+                        continue;
+                    }
 
                     try
                     {
-                        if (exception != null)
+                        if ((transportType & _requestedTransportType) == 0)
                         {
-                            Closed?.Invoke(this, exception);
+                            Log.TransportDisabledByClient(_logger, transportType);
+                        }
+                        else if (!transport.TransferFormats.Contains(transferFormatString, StringComparer.Ordinal))
+                        {
+                            Log.TransportDoesNotSupportTransferFormat(_logger, transportType, transferFormat);
                         }
                         else
                         {
-                            // Call the closed event. If there was an abort exception, it will be flowed forward
-                            // However, if there wasn't, this will just be null and we're good
-                            Closed?.Invoke(this, abortException);
+                            // The negotiation response gets cleared in the fallback scenario.
+                            if (negotiationResponse == null)
+                            {
+                                negotiationResponse = await GetNegotiationResponse();
+                                connectUrl = CreateConnectUrl(Url, negotiationResponse.ConnectionId);
+                            }
+
+                            Log.StartingTransport(_logger, transportType, connectUrl);
+                            await StartTransport(connectUrl, transportType, transferFormat);
+                            break;
                         }
                     }
                     catch (Exception ex)
                     {
-                        // Suppress (but log) the exception, this is user code
-                        Log.ErrorDuringClosedEvent(_logger, ex);
+                        Log.TransportFailed(_logger, transportType, ex);
+                        // Try the next transport
+                        // Clear the negotiation response so we know to re-negotiate.
+                        negotiationResponse = null;
                     }
+                }
+            }
 
-                }, null);
-
-                _receiveLoopTask = ReceiveAsync();
+            if (_transport == null)
+            {
+                throw new InvalidOperationException("Unable to connect to the server with any of the available transports.");
             }
         }
 
@@ -414,7 +325,8 @@ namespace Microsoft.AspNetCore.Sockets.Client
         {
             var options = new PipeOptions(writerScheduler: PipeScheduler.Inline, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
             var pair = DuplexPipe.CreateConnectionPair(options, options);
-            _transportChannel = pair.Transport;
+            _transportPipe = pair.Transport;
+            _applicationPipe = pair.Application;
             _transport = _transportFactory.CreateTransport(transportType);
 
             // Start the transport, giving it one end of the pipeline
@@ -438,14 +350,14 @@ namespace Microsoft.AspNetCore.Sockets.Client
 
                 while (true)
                 {
-                    if (_connectionState != ConnectionState.Connected)
+                    if (_disposed.IsCancellationRequested)
                     {
                         Log.SkipRaisingReceiveEvent(_logger);
 
                         break;
                     }
 
-                    var result = await Input.ReadAsync();
+                    var result = await Input.ReadAsync(_disposed.Token);
                     var buffer = result.Buffer;
 
                     try
@@ -492,6 +404,10 @@ namespace Microsoft.AspNetCore.Sockets.Client
                     }
                 }
             }
+            catch(OperationCanceledException)
+            {
+                // We've been disposed, just shut down.
+            }
             catch (Exception ex)
             {
                 Input.Complete(ex);
@@ -529,19 +445,12 @@ namespace Microsoft.AspNetCore.Sockets.Client
             await Output.WriteAsync(data);
         }
 
-        // AbortAsync creates a few thread-safety races that we are OK with.
-        //  1. If the transport shuts down gracefully after AbortAsync is called but BEFORE _abortException is called, then the
-        //     Closed event will not receive the Abort exception. This is OK because technically the transport was shut down gracefully
-        //     before it was aborted
-        //  2. If the transport is closed gracefully and then AbortAsync is called before it captures the _abortException value
-        //     the graceful shutdown could be turned into an abort. However, again, this is an inherent race between two different conditions:
-        //     The transport shutting down because the server went away, and the user requesting the Abort
-        //  3. Finally, because this is an instance field, there is a possible race around accidentally re-using _abortException in the restarted
-        //     connection. The scenario here is: AbortAsync(someException); StartAsync(); CloseAsync(); Where the _abortException value from the
-        //     first AbortAsync call is still set at the time CloseAsync gets to calling the Closed event. However, this can't happen because the
-        //     StartAsync method can't be called until the connection state is changed to Disconnected, which happens AFTER the close code
-        //     captures and resets _abortException.
-        public async Task AbortAsync(Exception exception) => await StopAsyncCore(exception ?? throw new ArgumentNullException(nameof(exception))).ForceAsync();
+        public Task AbortAsync(Exception exception)
+        {
+            // Simulate an error from the transport side by completing it.
+            _applicationPipe.Output.Complete(exception);
+            return Task.CompletedTask;
+        }
 
         public async Task StopAsync() => await StopAsyncCore(exception: null).ForceAsync();
 
@@ -560,9 +469,6 @@ namespace Microsoft.AspNetCore.Sockets.Client
             // side due to an error. We are resilient to this since we merely try to close the channel here and the
             // channel can be closed only once. As a result the continuation that does actual job and raises the Closed
             // event runs always only once.
-
-            // See comment at AbortAsync for more discussion on the thread-safety of this.
-            _abortException = exception;
 
             Log.StoppingClient(_logger);
 
@@ -597,7 +503,7 @@ namespace Microsoft.AspNetCore.Sockets.Client
                 transport = _transport;
             }
 
-            if (_transportChannel != null)
+            if (_transportPipe != null)
             {
                 Output.Complete();
             }
@@ -711,11 +617,62 @@ namespace Microsoft.AspNetCore.Sockets.Client
             }
         }
 
+        private HttpClient CreateHttpClient()
+        {
+            HttpMessageHandler httpMessageHandler = null;
+            if (_httpOptions != null)
+            {
+                var httpClientHandler = new HttpClientHandler();
+                if (_httpOptions.Proxy != null)
+                {
+                    httpClientHandler.Proxy = _httpOptions.Proxy;
+                }
+                if (_httpOptions.Cookies != null)
+                {
+                    httpClientHandler.CookieContainer = _httpOptions.Cookies;
+                }
+                if (_httpOptions.ClientCertificates != null)
+                {
+                    httpClientHandler.ClientCertificates.AddRange(_httpOptions.ClientCertificates);
+                }
+                if (_httpOptions.UseDefaultCredentials != null)
+                {
+                    httpClientHandler.UseDefaultCredentials = _httpOptions.UseDefaultCredentials.Value;
+                }
+                if (_httpOptions.Credentials != null)
+                {
+                    httpClientHandler.Credentials = _httpOptions.Credentials;
+                }
+
+                httpMessageHandler = httpClientHandler;
+                if (_httpOptions.HttpMessageHandler != null)
+                {
+                    httpMessageHandler = _httpOptions.HttpMessageHandler(httpClientHandler);
+                    if (httpMessageHandler == null)
+                    {
+                        throw new InvalidOperationException("Configured HttpMessageHandler did not return a value.");
+                    }
+                }
+            }
+
+            var httpClient = httpMessageHandler == null ? new HttpClient() : new HttpClient(httpMessageHandler);
+            httpClient.Timeout = HttpClientTimeout;
+
+            return httpClient;
+        }
+
+        private void CheckDisposed()
+        {
+            if (_disposed.IsCancellationRequested)
+            {
+                throw new ObjectDisposedException(nameof(HttpConnection));
+            }
+        }
+
         // Internal because it's used by logging to avoid ToStringing prematurely.
         internal enum ConnectionState
         {
             Disconnected,
-            Connecting,
             Connected,
             Disposed
         }
