@@ -179,6 +179,14 @@ namespace Microsoft.AspNetCore.SignalR
                                         return false;
                                     }
 
+                                    if (!Protocol.CheckVersionSupport(handshakeRequestMessage.Version, out var minimumSupportedVersion))
+                                    {
+                                        Log.ProtocolVersionFailed(_logger, minimumSupportedVersion, handshakeRequestMessage.Protocol, handshakeRequestMessage.Version);
+                                        await WriteHandshakeResponseAsync(new HandshakeResponseMessage(
+                                            $"The protocol '{handshakeRequestMessage.Protocol}' is supported. But the minimum protocol version allowed is {minimumSupportedVersion} and the client tried version {handshakeRequestMessage.Version}."));
+                                        return false;
+                                    }
+
                                     // If there's a transfer format feature, we need to check if we're compatible and set the active format.
                                     // If there isn't a feature, it means that the transport supports binary data and doesn't need us to tell them
                                     // what format we're writing.
@@ -308,6 +316,9 @@ namespace Microsoft.AspNetCore.SignalR
             private static readonly Action<ILogger, Exception> _handshakeFailed =
                 LoggerMessage.Define(LogLevel.Error, new EventId(5, "HandshakeFailed"), "Failed connection handshake.");
 
+            private static readonly Action<ILogger, int, string, int, Exception> _protocolVersionFailed =
+                LoggerMessage.Define<int, string, int>(LogLevel.Warning, new EventId(6, "ProtocolVersionFailed"), "Server supports a minimum of version {ServerVersion} of protocol {Protocol}. Client tried to use version {ClientVersion}.");
+
             public static void HandshakeComplete(ILogger logger, string hubProtocol)
             {
                 _handshakeComplete(logger, hubProtocol, null);
@@ -331,6 +342,11 @@ namespace Microsoft.AspNetCore.SignalR
             public static void HandshakeFailed(ILogger logger, Exception exception)
             {
                 _handshakeFailed(logger, exception);
+            }
+
+            public static void ProtocolVersionFailed(ILogger logger, int serverVersion, string protocolName, int clientVersion)
+            {
+                _protocolVersionFailed(logger, serverVersion, protocolName, clientVersion, null);
             }
         }
 

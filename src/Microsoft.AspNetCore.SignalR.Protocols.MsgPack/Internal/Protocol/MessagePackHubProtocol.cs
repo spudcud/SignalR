@@ -7,7 +7,6 @@ using System.IO;
 using System.Runtime.ExceptionServices;
 using Microsoft.AspNetCore.Protocols;
 using Microsoft.AspNetCore.SignalR.Internal.Formatters;
-using Microsoft.AspNetCore.Sockets;
 using Microsoft.Extensions.Options;
 using MsgPack;
 using MsgPack.Serialization;
@@ -21,10 +20,13 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
         private const int NonVoidResult = 3;
 
         public static readonly string ProtocolName = "messagepack";
+        public static readonly int ProtocolVersion = 1;
 
         public SerializationContext SerializationContext { get; }
 
         public string Name => ProtocolName;
+
+        public int Version => ProtocolVersion;
 
         public TransferFormat TransferFormat => TransferFormat.Binary;
 
@@ -35,6 +37,16 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
         public MessagePackHubProtocol(IOptions<MessagePackHubProtocolOptions> options)
         {
             SerializationContext = options.Value.SerializationContext;
+        }
+
+        public bool CheckVersionSupport(int version, out int minimumSupportedVersion)
+        {
+            minimumSupportedVersion = Version;
+            if (version == Version)
+            {
+                return true;
+            }
+            return false;
         }
 
         public bool TryParseMessages(ReadOnlyMemory<byte> input, IInvocationBinder binder, IList<HubMessage> messages)
