@@ -179,11 +179,11 @@ namespace Microsoft.AspNetCore.SignalR
                                         return false;
                                     }
 
-                                    if (!Protocol.CheckVersionSupport(handshakeRequestMessage.Version, out var minimumSupportedVersion))
+                                    if (!Protocol.IsVersionSupported(handshakeRequestMessage.Version))
                                     {
-                                        Log.ProtocolVersionFailed(_logger, minimumSupportedVersion, handshakeRequestMessage.Protocol, handshakeRequestMessage.Version);
+                                        Log.ProtocolVersionFailed(_logger, handshakeRequestMessage.Protocol, handshakeRequestMessage.Version);
                                         await WriteHandshakeResponseAsync(new HandshakeResponseMessage(
-                                            $"The protocol '{handshakeRequestMessage.Protocol}' is supported. But the minimum protocol version allowed is {minimumSupportedVersion} and the client tried version {handshakeRequestMessage.Version}."));
+                                            $"The server does not support version {handshakeRequestMessage.Version} of the '{handshakeRequestMessage.Protocol}' protocol."));
                                         return false;
                                     }
 
@@ -316,8 +316,8 @@ namespace Microsoft.AspNetCore.SignalR
             private static readonly Action<ILogger, Exception> _handshakeFailed =
                 LoggerMessage.Define(LogLevel.Error, new EventId(5, "HandshakeFailed"), "Failed connection handshake.");
 
-            private static readonly Action<ILogger, int, string, int, Exception> _protocolVersionFailed =
-                LoggerMessage.Define<int, string, int>(LogLevel.Warning, new EventId(6, "ProtocolVersionFailed"), "Server supports a minimum of version {ServerVersion} of protocol {Protocol}. Client tried to use version {ClientVersion}.");
+            private static readonly Action<ILogger, string, int, Exception> _protocolVersionFailed =
+                LoggerMessage.Define<string, int>(LogLevel.Warning, new EventId(6, "ProtocolVersionFailed"), "Server does not support version {Version} of the {Protocol} protocol.");
 
             public static void HandshakeComplete(ILogger logger, string hubProtocol)
             {
@@ -344,9 +344,9 @@ namespace Microsoft.AspNetCore.SignalR
                 _handshakeFailed(logger, exception);
             }
 
-            public static void ProtocolVersionFailed(ILogger logger, int serverVersion, string protocolName, int clientVersion)
+            public static void ProtocolVersionFailed(ILogger logger, string protocolName, int version)
             {
-                _protocolVersionFailed(logger, serverVersion, protocolName, clientVersion, null);
+                _protocolVersionFailed(logger, protocolName, version, null);
             }
         }
 
