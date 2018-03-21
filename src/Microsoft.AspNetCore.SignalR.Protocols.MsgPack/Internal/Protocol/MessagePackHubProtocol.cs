@@ -37,7 +37,7 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
             SerializationContext = options.Value.SerializationContext;
         }
 
-        public bool TryParseMessages(ReadOnlySpan<byte> input, IInvocationBinder binder, IList<HubMessage> messages)
+        public bool TryParseMessages(ReadOnlyMemory<byte> input, IInvocationBinder binder, IList<HubMessage> messages)
         {
             while (BinaryMessageParser.TryParseMessage(ref input, out var payload))
             {
@@ -69,6 +69,8 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
                         return CreateCancelInvocationMessage(unpacker);
                     case HubProtocolConstants.PingMessageType:
                         return PingMessage.Instance;
+                    case HubProtocolConstants.CloseMessageType:
+                        return CreateCloseMessage(unpacker);
                     default:
                         throw new FormatException($"Invalid message type: {messageType}.");
                 }
@@ -165,6 +167,12 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
             return ApplyHeaders(headers, new CancelInvocationMessage(invocationId));
         }
 
+        private static CloseMessage CreateCloseMessage(Unpacker unpacker)
+        {
+            var error = ReadString(unpacker, "error");
+            return new CloseMessage(error);
+        }
+
         private static Dictionary<string, string> ReadHeaders(Unpacker unpacker)
         {
             var headerCount = ReadMapLength(unpacker, "headers");
@@ -213,14 +221,11 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
             }
         }
 
-        private static T ApplyHeaders<T>(IDictionary<string, string> source, T destination) where T: HubInvocationMessage
+        private static T ApplyHeaders<T>(IDictionary<string, string> source, T destination) where T : HubInvocationMessage
         {
-            if(source != null && source.Count > 0)
+            if (source != null && source.Count > 0)
             {
-                foreach(var header in source)
-                {
-                    destination.Headers[header.Key] = header.Value;
-                }
+                destination.Headers = source;
             }
 
             return destination;
@@ -271,6 +276,9 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
                     break;
                 case PingMessage pingMessage:
                     WritePingMessage(pingMessage, packer);
+                    break;
+                case CloseMessage closeMessage:
+                    WriteCloseMessage(closeMessage, packer);
                     break;
                 default:
                     throw new FormatException($"Unexpected message type: {message.GetType().Name}");
@@ -342,6 +350,20 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
             packer.Pack(HubProtocolConstants.CancelInvocationMessageType);
             PackHeaders(packer, message.Headers);
             packer.PackString(message.InvocationId);
+        }
+
+        private void WriteCloseMessage(CloseMessage message, Packer packer)
+        {
+            packer.PackArrayHeader(2);
+            packer.Pack(HubProtocolConstants.CloseMessageType);
+            if (string.IsNullOrEmpty(message.Error))
+            {
+                packer.PackNull();
+            }
+            else
+            {
+                packer.PackString(message.Error);
+            }
         }
 
         private void WritePingMessage(PingMessage pingMessage, Packer packer)

@@ -49,7 +49,7 @@ namespace Microsoft.AspNetCore.Sockets
                 if (HttpMethods.IsPost(context.Request.Method))
                 {
                     // POST /{path}
-                    await ProcessSend(context);
+                    await ProcessSend(context, options);
                 }
                 else if (HttpMethods.IsGet(context.Request.Method))
                 {
@@ -88,7 +88,7 @@ namespace Microsoft.AspNetCore.Sockets
             }
         }
 
-        private async Task ExecuteEndpointAsync(HttpContext context, ConnectionDelegate ConnectionDelegate, HttpSocketOptions options, ConnectionLogScope logScope)
+        private async Task ExecuteEndpointAsync(HttpContext context, ConnectionDelegate connectionDelegate, HttpSocketOptions options, ConnectionLogScope logScope)
         {
             var supportedTransports = options.Transports;
 
@@ -99,7 +99,7 @@ namespace Microsoft.AspNetCore.Sockets
             if (headers.Accept?.Contains(new Net.Http.Headers.MediaTypeHeaderValue("text/event-stream")) == true)
             {
                 // Connection must already exist
-                var connection = await GetConnectionAsync(context);
+                var connection = await GetConnectionAsync(context, options);
                 if (connection == null)
                 {
                     // No such connection, GetConnection already set the response status code
@@ -120,7 +120,7 @@ namespace Microsoft.AspNetCore.Sockets
                 // We only need to provide the Input channel since writing to the application is handled through /send.
                 var sse = new ServerSentEventsTransport(connection.Application.Input, connection.ConnectionId, _loggerFactory);
 
-                await DoPersistentConnection(ConnectionDelegate, sse, context, connection);
+                await DoPersistentConnection(connectionDelegate, sse, context, connection);
             }
             else if (context.WebSockets.IsWebSocketRequest)
             {
@@ -142,14 +142,14 @@ namespace Microsoft.AspNetCore.Sockets
 
                 var ws = new WebSocketsTransport(options.WebSockets, connection.Application, connection, _loggerFactory);
 
-                await DoPersistentConnection(ConnectionDelegate, ws, context, connection);
+                await DoPersistentConnection(connectionDelegate, ws, context, connection);
             }
             else
             {
                 // GET /{path} maps to long polling
 
                 // Connection must already exist
-                var connection = await GetConnectionAsync(context);
+                var connection = await GetConnectionAsync(context, options);
                 if (connection == null)
                 {
                     // No such connection, GetConnection already set the response status code
@@ -203,7 +203,7 @@ namespace Microsoft.AspNetCore.Sockets
 
                         connection.Items[ConnectionMetadataNames.Transport] = TransportType.LongPolling;
 
-                        connection.ApplicationTask = ExecuteApplication(ConnectionDelegate, connection);
+                        connection.ApplicationTask = ExecuteApplication(connectionDelegate, connection);
                     }
                     else
                     {
@@ -292,7 +292,7 @@ namespace Microsoft.AspNetCore.Sockets
             }
         }
 
-        private async Task DoPersistentConnection(ConnectionDelegate ConnectionDelegate,
+        private async Task DoPersistentConnection(ConnectionDelegate connectionDelegate,
                                                   IHttpTransport transport,
                                                   HttpContext context,
                                                   DefaultConnectionContext connection)
@@ -324,7 +324,7 @@ namespace Microsoft.AspNetCore.Sockets
                 connection.Status = DefaultConnectionContext.ConnectionStatus.Active;
 
                 // Call into the end point passing the connection
-                connection.ApplicationTask = ExecuteApplication(ConnectionDelegate, connection);
+                connection.ApplicationTask = ExecuteApplication(connectionDelegate, connection);
 
                 // Start the transport
                 connection.TransportTask = transport.ProcessRequestAsync(context, context.RequestAborted);
@@ -340,7 +340,7 @@ namespace Microsoft.AspNetCore.Sockets
             await _manager.DisposeAndRemoveAsync(connection);
         }
 
-        private async Task ExecuteApplication(ConnectionDelegate ConnectionDelegate, ConnectionContext connection)
+        private async Task ExecuteApplication(ConnectionDelegate connectionDelegate, ConnectionContext connection)
         {
             // Verify some initialization invariants
             // We want to be positive that the IConnectionInherentKeepAliveFeature is initialized before invoking the application, if the long polling transport is in use.
@@ -353,7 +353,7 @@ namespace Microsoft.AspNetCore.Sockets
             await AwaitableThreadPool.Yield();
 
             // Running this in an async method turns sync exceptions into async ones
-            await ConnectionDelegate(connection);
+            await connectionDelegate(connection);
         }
 
         private Task ProcessNegotiate(HttpContext context, HttpSocketOptions options, ConnectionLogScope logScope)
@@ -361,7 +361,7 @@ namespace Microsoft.AspNetCore.Sockets
             context.Response.ContentType = "application/json";
 
             // Establish the connection
-            var connection = CreateConnectionInternal(options);
+            var connection = _manager.CreateConnection();
 
             // Set the Connection ID on the logging scope so that logs from now on will have the
             // Connection ID metadata set.
@@ -441,9 +441,9 @@ namespace Microsoft.AspNetCore.Sockets
 
         private static string GetConnectionId(HttpContext context) => context.Request.Query["id"];
 
-        private async Task ProcessSend(HttpContext context)
+        private async Task ProcessSend(HttpContext context, HttpSocketOptions options)
         {
-            var connection = await GetConnectionAsync(context);
+            var connection = await GetConnectionAsync(context, options);
             if (connection == null)
             {
                 // No such connection, GetConnection already set the response status code
@@ -517,7 +517,7 @@ namespace Microsoft.AspNetCore.Sockets
             return true;
         }
 
-        private async Task<DefaultConnectionContext> GetConnectionAsync(HttpContext context)
+        private async Task<DefaultConnectionContext> GetConnectionAsync(HttpContext context, HttpSocketOptions options)
         {
             var connectionId = GetConnectionId(context);
 
@@ -539,16 +539,25 @@ namespace Microsoft.AspNetCore.Sockets
                 return null;
             }
 
+            EnsureConnectionStateInternal(connection, options);
+
             return connection;
         }
 
-        private DefaultConnectionContext CreateConnectionInternal(HttpSocketOptions options)
+        private void EnsureConnectionStateInternal(DefaultConnectionContext connection, HttpSocketOptions options)
         {
-            var transportPipeOptions = new PipeOptions(pauseWriterThreshold: options.TransportMaxBufferSize, resumeWriterThreshold: options.TransportMaxBufferSize / 2, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
-            var appPipeOptions = new PipeOptions(pauseWriterThreshold: options.ApplicationMaxBufferSize, resumeWriterThreshold: options.ApplicationMaxBufferSize / 2, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
-            return _manager.CreateConnection(transportPipeOptions, appPipeOptions);
+            // If the connection doesn't have a pipe yet then create one, we lazily create the pipe to save on allocations until the client actually connects
+            if (connection.Transport == null)
+            {
+                var transportPipeOptions = new PipeOptions(pauseWriterThreshold: options.TransportMaxBufferSize, resumeWriterThreshold: options.TransportMaxBufferSize / 2, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
+                var appPipeOptions = new PipeOptions(pauseWriterThreshold: options.ApplicationMaxBufferSize, resumeWriterThreshold: options.ApplicationMaxBufferSize / 2, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
+                var pair = DuplexPipe.CreateConnectionPair(transportPipeOptions, appPipeOptions);
+                connection.Transport = pair.Application;
+                connection.Application = pair.Transport;
+            }
         }
 
+        // This is only used for WebSockets connections, which can connect directly without negotiating
         private async Task<DefaultConnectionContext> GetOrCreateConnectionAsync(HttpContext context, HttpSocketOptions options)
         {
             var connectionId = GetConnectionId(context);
@@ -557,7 +566,7 @@ namespace Microsoft.AspNetCore.Sockets
             // There's no connection id so this is a brand new connection
             if (StringValues.IsNullOrEmpty(connectionId))
             {
-                connection = CreateConnectionInternal(options);
+                connection = _manager.CreateConnection();
             }
             else if (!_manager.TryGetConnection(connectionId, out connection))
             {
@@ -566,6 +575,8 @@ namespace Microsoft.AspNetCore.Sockets
                 await context.Response.WriteAsync("No Connection with that ID");
                 return null;
             }
+
+            EnsureConnectionStateInternal(connection, options);
 
             return connection;
         }
