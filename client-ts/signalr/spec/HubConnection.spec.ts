@@ -399,6 +399,39 @@ describe("HubConnection", () => {
             expect(numInvocations).toBe(1);
         });
 
+        it("can unsubscribe all handlers from on", async () => {
+            const connection = new TestConnection();
+            const hubConnection = new HubConnection(connection, commonOptions);
+
+            connection.receiveHandshakeResponse();
+
+            let numInvocations = 0;
+            const callback = () => numInvocations++;
+            const callback2 = () => numInvocations++;
+            hubConnection.on("message", callback);
+            hubConnection.on("message", callback2);
+
+            connection.receive({
+                arguments: [],
+                invocationId: 0,
+                nonblocking: true,
+                target: "message",
+                type: MessageType.Invocation,
+            });
+
+            hubConnection.off("message");
+
+            connection.receive({
+                arguments: [],
+                invocationId: 0,
+                nonblocking: true,
+                target: "message",
+                type: MessageType.Invocation,
+            });
+
+            expect(numInvocations).toBe(2);
+        });
+
         it("unsubscribing from non-existing callbacks no-ops", async () => {
             const connection = new TestConnection();
             const hubConnection = new HubConnection(connection, commonOptions);
