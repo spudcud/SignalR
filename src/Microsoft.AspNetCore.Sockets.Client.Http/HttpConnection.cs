@@ -30,9 +30,8 @@ namespace Microsoft.AspNetCore.Sockets.Client
         private readonly ILogger _logger;
 
         private readonly SemaphoreSlim _stateLock = new SemaphoreSlim(1, 1);
-        private bool _disposed = false;
-        private bool _started = false;
-
+        private volatile bool _disposed = false;
+        private CancellationTokenSource _startCts = new CancellationTokenSource();
         private IDuplexPipe _transportPipe;
         private IDuplexPipe _applicationPipe;
 
@@ -40,25 +39,27 @@ namespace Microsoft.AspNetCore.Sockets.Client
         private readonly HttpOptions _httpOptions;
         private ITransport _transport;
         private Task _receiveLoopTask;
-        private TaskCompletionSource<object> _startTcs;
-        private TaskCompletionSource<object> _closeTcs;
-        private TaskQueue _eventQueue;
         private readonly ITransportFactory _transportFactory;
         private string _connectionId;
-        private Exception _abortException;
-        private readonly TimeSpan _eventQueueDrainTimeout = TimeSpan.FromSeconds(5);
-        private PipeReader Input => _transportPipe.Input;
-        private PipeWriter Output => _transportPipe.Output;
-        private readonly List<ReceiveCallback> _callbacks = new List<ReceiveCallback>();
         private readonly TransportType _requestedTransportType = TransportType.All;
         private readonly ConnectionLogScope _logScope;
         private readonly IDisposable _scopeDisposable;
 
         public Uri Url { get; }
 
-        public IFeatureCollection Features { get; } = new FeatureCollection();
+        public IDuplexPipe Transport
+        {
+            get
+            {
+                if (_transportPipe == null)
+                {
+                    throw new InvalidOperationException($"Cannot access the {nameof(Transport)} pipe before the connection has started");
+                }
+                return _transportPipe;
+            }
+        }
 
-        public event Action<IConnection, Exception> Closed;
+        public IFeatureCollection Features { get; } = new FeatureCollection();
 
         public HttpConnection(Uri url)
             : this(url, TransportType.All)
@@ -114,42 +115,24 @@ namespace Microsoft.AspNetCore.Sockets.Client
 
         public async Task StartAsync(TransferFormat transferFormat) => await StartAsyncCore(transferFormat).ForceAsync();
 
-        private async Task<NegotiationResponse> GetNegotiationResponse()
-        {
-            var negotiationResponse = await Negotiate(Url, _httpClient, _logger);
-            _connectionId = negotiationResponse.ConnectionId;
-            _logScope.ConnectionId = _connectionId;
-            return negotiationResponse;
-        }
-
         private async Task StartAsyncCore(TransferFormat transferFormat)
         {
             CheckDisposed();
+            _startCts.Token.ThrowIfCancellationRequested();
 
             await _stateLock.WaitAsync();
-
             try
             {
                 CheckDisposed();
-                if (!_started)
+
+                if (_transport != null)
                 {
                     throw new InvalidOperationException($"The '{nameof(StartAsync)}' method cannot be called if the connection has already been started.");
                 }
 
-                _startTcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _eventQueue = new TaskQueue();
-
                 Log.HttpConnectionStarting(_logger);
 
-                await SelectAndStartTransport(transferFormat);
-
-                // Start receiving
-                _receiveLoopTask = ReceiveAsync();
-
-                // Wire up to the Pipe's OnWriterCompleted, which indicates the transport completed (because the server closed).
-                // We dump the task from our OnWriterCompleted method because OnWriterCompleted is void-returning.
-                // Also, @pakrym says that if the pipe is already completed at the time we call this, the callback will still be run.
-                Input.OnWriterCompleted((exception, state) => _ = OnWriterCompleted(exception), null);
+                await SelectAndStartTransport(transferFormat, _startCts.Token);
             }
             finally
             {
@@ -157,44 +140,68 @@ namespace Microsoft.AspNetCore.Sockets.Client
             }
         }
 
-        private async Task OnWriterCompleted(Exception exception)
+
+        public Task AbortAsync(Exception exception)
         {
-            // We're done, mark as disposed.
-            _disposed = true;
+            // Simulate an error occurring in the transport by completing the pipe
+            // heading to the Application with that exception (normally the Transport would produce this exception)
+            _applicationPipe.Output.Complete(exception);
 
-            Log.ProcessRemainingMessages(_logger);
-            await _receiveLoopTask;
+            // We don't actually complete our pipes; the consumer will do that.
+            return Task.CompletedTask;
+        }
 
-            Log.DrainEvents(_logger);
-            await Task.WhenAny(_eventQueue.Drain().NoThrow(), Task.Delay(_eventQueueDrainTimeout));
+        public async Task DisposeAsync() => await DisposeAsyncCore().ForceAsync();
 
-            Log.CompleteClosed(_logger);
-            _logScope.ConnectionId = null;
+        private async Task DisposeAsyncCore()
+        {
+            if (_disposed)
+            {
+                return;
+            }
 
+            // This will cancel an in-progress start early
+            _startCts.Cancel();
+
+            await _stateLock.WaitAsync();
             try
             {
-                Closed?.Invoke(this, exception);
+                if (_disposed)
+                {
+                    return;
+                }
+
+                Log.DisposingClient(_logger);
+
+                // Complete our end of the pipes and null everything out
+                _transportPipe.Output.Complete();
+                _transportPipe.Input.Complete();
+
+                _transport = null;
+                _transportPipe = null;
+                _applicationPipe = null;
+
+                _httpClient?.Dispose();
+                _scopeDisposable.Dispose();
             }
-            catch (Exception ex)
+            finally
             {
-                // Suppress (but log) the exception, this is user code
-                Log.ErrorDuringClosedEvent(_logger, ex);
+                _stateLock.Release();
             }
         }
 
-        private async Task SelectAndStartTransport(TransferFormat transferFormat)
+        private async Task SelectAndStartTransport(TransferFormat transferFormat, CancellationToken cancellationToken)
         {
             if (_requestedTransportType == TransportType.WebSockets)
             {
-                Log.StartingTransport(_logger, _requestedTransportType, connectUrl);
+                Log.StartingTransport(_logger, _requestedTransportType, Url);
                 await StartTransport(Url, _requestedTransportType, transferFormat);
             }
             else
             {
                 var negotiationResponse = await GetNegotiationResponse();
 
-                // Connection is being disposed while start was in progress
-                CheckDisposed();
+                cancellationToken.ThrowIfCancellationRequested();
 
                 // This should only need to happen once
                 var connectUrl = CreateConnectUrl(Url, negotiationResponse.ConnectionId);
@@ -206,8 +213,7 @@ namespace Microsoft.AspNetCore.Sockets.Client
 
                 foreach (var transport in negotiationResponse.AvailableTransports)
                 {
-                    // Don't keep falling back if we're disposed while trying to connect.
-                    CheckDisposed();
+                    cancellationToken.ThrowIfCancellationRequested();
 
                     if (!Enum.TryParse<TransportType>(transport.Transport, out var transportType))
                     {
@@ -323,13 +329,16 @@ namespace Microsoft.AspNetCore.Sockets.Client
 
         private async Task StartTransport(Uri connectUrl, TransportType transportType, TransferFormat transferFormat)
         {
+            // Create the pipe pair (Application's writer is connected to Transport's reader, and vice versa)
             var options = new PipeOptions(writerScheduler: PipeScheduler.Inline, readerScheduler: PipeScheduler.ThreadPool, useSynchronizationContext: false);
             var pair = DuplexPipe.CreateConnectionPair(options, options);
             _transportPipe = pair.Transport;
             _applicationPipe = pair.Application;
+
+            // Construct the transport
             _transport = _transportFactory.CreateTransport(transportType);
 
-            // Start the transport, giving it one end of the pipeline
+            // Start the transport, giving it one end of the pipe
             try
             {
                 await _transport.StartAsync(connectUrl, pair.Application, transferFormat, this);
@@ -339,281 +348,6 @@ namespace Microsoft.AspNetCore.Sockets.Client
                 Log.ErrorStartingTransport(_logger, _transport, ex);
                 _transport = null;
                 throw;
-            }
-        }
-
-        private async Task ReceiveAsync()
-        {
-            try
-            {
-                Log.HttpReceiveStarted(_logger);
-
-                while (true)
-                {
-                    if (_disposed.IsCancellationRequested)
-                    {
-                        Log.SkipRaisingReceiveEvent(_logger);
-
-                        break;
-                    }
-
-                    var result = await Input.ReadAsync(_disposed.Token);
-                    var buffer = result.Buffer;
-
-                    try
-                    {
-                        if (!buffer.IsEmpty)
-                        {
-                            Log.ScheduleReceiveEvent(_logger);
-                            var data = buffer.ToArray();
-
-                            _ = _eventQueue.Enqueue(async () =>
-                            {
-                                Log.RaiseReceiveEvent(_logger);
-
-                                // Copying the callbacks to avoid concurrency issues
-                                ReceiveCallback[] callbackCopies;
-                                lock (_callbacks)
-                                {
-                                    callbackCopies = new ReceiveCallback[_callbacks.Count];
-                                    _callbacks.CopyTo(callbackCopies);
-                                }
-
-                                foreach (var callbackObject in callbackCopies)
-                                {
-                                    try
-                                    {
-                                        await callbackObject.InvokeAsync(data);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        Log.ExceptionThrownFromCallback(_logger, nameof(OnReceived), ex);
-                                    }
-                                }
-                            });
-
-                        }
-                        else if (result.IsCompleted)
-                        {
-                            break;
-                        }
-                    }
-                    finally
-                    {
-                        Input.AdvanceTo(buffer.End);
-                    }
-                }
-            }
-            catch(OperationCanceledException)
-            {
-                // We've been disposed, just shut down.
-            }
-            catch (Exception ex)
-            {
-                Input.Complete(ex);
-
-                Log.ErrorReceiving(_logger, ex);
-            }
-            finally
-            {
-                Input.Complete();
-            }
-
-            Log.EndReceive(_logger);
-        }
-
-        public async Task SendAsync(byte[] data, CancellationToken cancellationToken = default) =>
-            await SendAsyncCore(data, cancellationToken).ForceAsync();
-
-        private async Task SendAsyncCore(byte[] data, CancellationToken cancellationToken)
-        {
-            if (data == null)
-            {
-                throw new ArgumentNullException(nameof(data));
-            }
-
-            if (_connectionState != ConnectionState.Connected)
-            {
-                throw new InvalidOperationException(
-                    "Cannot send messages when the connection is not in the Connected state.");
-            }
-
-            Log.SendingMessage(_logger);
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            await Output.WriteAsync(data);
-        }
-
-        public Task AbortAsync(Exception exception)
-        {
-            // Simulate an error from the transport side by completing it.
-            _applicationPipe.Output.Complete(exception);
-            return Task.CompletedTask;
-        }
-
-        public async Task StopAsync() => await StopAsyncCore(exception: null).ForceAsync();
-
-        private async Task StopAsyncCore(Exception exception)
-        {
-            lock (_stateChangeLock)
-            {
-                if (!(_connectionState == ConnectionState.Connecting || _connectionState == ConnectionState.Connected))
-                {
-                    Log.SkippingStop(_logger);
-                    return;
-                }
-            }
-
-            // Note that this method can be called at the same time when the connection is being closed from the server
-            // side due to an error. We are resilient to this since we merely try to close the channel here and the
-            // channel can be closed only once. As a result the continuation that does actual job and raises the Closed
-            // event runs always only once.
-
-            Log.StoppingClient(_logger);
-
-            try
-            {
-                await _startTcs.Task;
-            }
-            catch
-            {
-                // We only await the start task to make sure that StartAsync completed. The
-                // _startTask is returned to the user and they should handle exceptions.
-            }
-
-            TaskCompletionSource<object> closeTcs = null;
-            Task receiveLoopTask = null;
-            ITransport transport = null;
-
-            lock (_stateChangeLock)
-            {
-                // Copy locals in lock to prevent a race when the server closes the connection and StopAsync is called
-                // at the same time
-                if (_connectionState != ConnectionState.Connected)
-                {
-                    // If not Connected then someone else disconnected while StopAsync was in progress, we can now NO-OP
-                    return;
-                }
-
-                // Create locals of relevant member variables to prevent a race when Closed event triggers a connect
-                // while StopAsync is still running
-                closeTcs = _closeTcs;
-                receiveLoopTask = _receiveLoopTask;
-                transport = _transport;
-            }
-
-            if (_transportPipe != null)
-            {
-                Output.Complete();
-            }
-
-            if (transport != null)
-            {
-                await transport.StopAsync();
-            }
-
-            if (receiveLoopTask != null)
-            {
-                await receiveLoopTask;
-            }
-
-            if (closeTcs != null)
-            {
-                await closeTcs.Task;
-            }
-        }
-
-        public async Task DisposeAsync() => await DisposeAsyncCore().ForceAsync();
-
-        private async Task DisposeAsyncCore()
-        {
-            // This will no-op if we're already stopped
-            await StopAsyncCore(exception: null);
-
-            if (ChangeState(to: ConnectionState.Disposed) == ConnectionState.Disposed)
-            {
-                Log.SkippingDispose(_logger);
-
-                // the connection was already disposed
-                return;
-            }
-
-            Log.DisposingClient(_logger);
-
-            _httpClient?.Dispose();
-            _scopeDisposable.Dispose();
-        }
-
-        public IDisposable OnReceived(Func<byte[], object, Task> callback, object state)
-        {
-            var receiveCallback = new ReceiveCallback(callback, state);
-            lock (_callbacks)
-            {
-                _callbacks.Add(receiveCallback);
-            }
-            return new Subscription(receiveCallback, _callbacks);
-        }
-
-        private class ReceiveCallback
-        {
-            private readonly Func<byte[], object, Task> _callback;
-            private readonly object _state;
-
-            public ReceiveCallback(Func<byte[], object, Task> callback, object state)
-            {
-                _callback = callback;
-                _state = state;
-            }
-
-            public Task InvokeAsync(byte[] data)
-            {
-                return _callback(data, _state);
-            }
-        }
-
-        private class Subscription : IDisposable
-        {
-            private readonly ReceiveCallback _receiveCallback;
-            private readonly List<ReceiveCallback> _callbacks;
-            public Subscription(ReceiveCallback callback, List<ReceiveCallback> callbacks)
-            {
-                _receiveCallback = callback;
-                _callbacks = callbacks;
-            }
-
-            public void Dispose()
-            {
-                lock (_callbacks)
-                {
-                    _callbacks.Remove(_receiveCallback);
-                }
-            }
-        }
-
-        private ConnectionState ChangeState(ConnectionState from, ConnectionState to)
-        {
-            lock (_stateChangeLock)
-            {
-                var state = _connectionState;
-                if (_connectionState == from)
-                {
-                    _connectionState = to;
-                }
-
-                Log.ConnectionStateChanged(_logger, state, to);
-                return state;
-            }
-        }
-
-        private ConnectionState ChangeState(ConnectionState to)
-        {
-            lock (_stateChangeLock)
-            {
-                var state = _connectionState;
-                _connectionState = to;
-                Log.ConnectionStateChanged(_logger, state, to);
-                return state;
             }
         }
 
@@ -669,12 +403,12 @@ namespace Microsoft.AspNetCore.Sockets.Client
             }
         }
 
-        // Internal because it's used by logging to avoid ToStringing prematurely.
-        internal enum ConnectionState
+        private async Task<NegotiationResponse> GetNegotiationResponse()
         {
-            Disconnected,
-            Connected,
-            Disposed
+            var negotiationResponse = await Negotiate(Url, _httpClient, _logger);
+            _connectionId = negotiationResponse.ConnectionId;
+            _logScope.ConnectionId = _connectionId;
+            return negotiationResponse;
         }
 
         private class NegotiationResponse

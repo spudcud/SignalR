@@ -26,6 +26,7 @@ namespace Microsoft.AspNetCore.Sockets.Client
                 while (true)
                 {
                     var result = await application.Input.ReadAsync(transportCts.Token);
+                    result.ThrowIfCanceled();
                     var buffer = result.Buffer;
 
                     try
@@ -76,8 +77,8 @@ namespace Microsoft.AspNetCore.Sockets.Client
             }
             finally
             {
-                // Make sure the poll loop is terminated
-                transportCts.Cancel();
+                // Cancel the receive half of the transport after the close timeout
+                transportCts.CancelAfter(httpOptions.CloseTimeout);
             }
 
             Log.SendStopped(logger);
